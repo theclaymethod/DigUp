@@ -6,11 +6,12 @@ import Foundation
 /// in the Mac app (tens of milliseconds), not a process start.
 ///
 /// Protocol: one JSON request per line on stdin, one JSON response per line on stdout, carrying the request's `id`.
-///   {"op":"search","q":…,"code":bool,"kinds":[…],"limit":n,"meaning":bool,"prefix_last":bool}
+///   {"op":"search","q":…,"code":bool,"kinds":[…],"limit":n,"meaning":bool,"prefix_last":bool,"paths":[…]}
 ///       → {"hits":[…], "strong":n, "meaning":bool, "ms":{"embed":…,"search":…}}
 ///         `meaning` false: keyword-only (while typing, or while the encoder isn't ready); `strong`: the weaker-matches
 ///         fold (`Searcher.strongCount`); each hit has the fields of `digup search --json` plus segment_id, modified,
 ///         size and info.
+///         Optional `paths` filters before ranking; an empty array permits no files. Ready advertises `path-scope-v1`.
 ///   {"op":"embed_ahead","q":…,"code":bool}   → {"ok":true}: embeds and caches the text (the panel sends what's typed so
 ///                                               far on every keystroke, so the pause's vector is usually ready)
 ///   {"op":"text","segment":id,"code":bool}    → {"text":…}: the part of a file a hit points at, for the preview
@@ -129,6 +130,13 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
             let limit = request["limit"] as? Int ?? 40
             let wantMeaning = request["meaning"] as? Bool ?? true
             let prefixLast = request["prefix_last"] as? Bool ?? false
+            var paths: Set<String>?
+            if let value = request["paths"] {
+                guard let values = value as? [String], values.count <= 100_000 else {
+                    throw CLIError("paths must be an array of at most 100000 file paths")
+                }
+                paths = Set(values)
+            }
             let started = Date()
             var vector: [Float]?
             var warning: String?
@@ -148,12 +156,12 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
             let hits: [SearchHit]
             if code {
                 guard let codeSearcher else { return ["hits": [], "strong": 0, "meaning": false] }
-                hits = try codeSearcher.search(text, queryVector: vector, limit: limit, prefixLast: prefixLast).filter {
+                hits = try codeSearcher.search(text, queryVector: vector, limit: limit, prefixLast: prefixLast, paths: paths).filter {
                     FolderSelection.isSearched($0.path, folders: codeRoots, skipped: codeSkipped)
                         && FileManager.default.fileExists(atPath: $0.path)
                 }
             } else {
-                hits = try searcher.search(text, queryVector: vector, kinds: kinds, limit: limit, prefixLast: prefixLast)
+                hits = try searcher.search(text, queryVector: vector, kinds: kinds, limit: limit, prefixLast: prefixLast, paths: paths)
                     .filter {
                         (roots.isEmpty || FolderSelection.isSearched($0.path, folders: roots, skipped: skipped))
                             && !types.contains(($0.path as NSString).pathExtension.lowercased())
@@ -367,6 +375,6 @@ func searchService(_ args: Arguments) throws -> Int32 {
         codeRoots: (args.lists["--code-root"] ?? []).map { Arguments.folderURL($0).path },
         codeSkipped: (args.lists["--code-exclude"] ?? []).map { Arguments.folderURL($0).path },
         idleSeconds: args.values["--encoder-idle"].flatMap(Double.init) ?? 300)
-    emit(["event": "ready", "index": args.indexFolder.path])
+    emit(["event": "ready", "index": args.indexFolder.path, "capabilities": ["path-scope-v1"]])
     return service.serve()
 }

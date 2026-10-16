@@ -1,5 +1,8 @@
 import DigUpKit
 import Foundation
+#if canImport(Darwin)
+@preconcurrency import Darwin
+#endif
 
 /// Ends the indexing helper when reading one file runs away. Apple's PDF text extraction has grown without end on a
 /// page of some PDFs (30 GB in 3.5 minutes, never returning), and nothing stops code like that from outside but ending

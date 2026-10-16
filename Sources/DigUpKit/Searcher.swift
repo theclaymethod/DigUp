@@ -37,6 +37,7 @@ public final class Searcher {
     /// False for the vectors the later pass adds (`Indexer.finishLongFiles`): scored, but they don't set the scale.
     private var rowSetsScale: [Bool] = []
     private var fileKind: [Int64: FileKind] = [:]
+    private var filePath: [Int64: String] = [:]
     public private(set) var vectorSource: String?
     /// False after `releaseVectors()` (or `loadVectors: false`): keyword search still works, and the next search with
     /// a query vector loads them again.
@@ -99,8 +100,10 @@ public final class Searcher {
 
     private func reloadFiles() throws {
         fileKind.removeAll(keepingCapacity: true)
-        try store.db.query("SELECT id, kind FROM files") { row in
+        filePath.removeAll(keepingCapacity: true)
+        try store.db.query("SELECT id, kind, path FROM files") { row in
             fileKind[row.int(0)] = FileKind(rawValue: row.text(1) ?? "")
+            filePath[row.int(0)] = row.text(2)
         }
         vectorSource = try store.meta("vector_source")
     }
@@ -113,17 +116,33 @@ public final class Searcher {
     public static let codeWordWeight = 1.0
 
     public func search(_ text: String, queryVector: [Float]?, kinds: Set<FileKind>? = nil, limit: Int = 20,
-                       zGate: Double = 2.0, wordWeight: Double? = nil, prefixLast: Bool = false) throws -> [SearchHit] {
+                       zGate: Double = 2.0, wordWeight: Double? = nil, prefixLast: Bool = false,
+                       paths: Set<String>? = nil) throws -> [SearchHit] {
         let wordWeight = wordWeight ?? (isCode ? Self.codeWordWeight : Self.wordWeight)
         if queryVector != nil, !vectorsLoaded { try reload() }
         let fileKind = self.fileKind
-        let allowed = { (file: Int64) -> Bool in kinds == nil || fileKind[file].map { kinds!.contains($0) } ?? false }
+        let selected = paths.map { paths in Set(filePath.compactMap { paths.contains($0.value) ? $0.key : nil }) }
+        let allowed = { (file: Int64) -> Bool in
+            (selected == nil || selected!.contains(file))
+                && (kinds == nil || fileKind[file].map { kinds!.contains($0) } ?? false)
+        }
+        // Collection facets and visibility apply before truncation and relevance calibration.
+        // A temporary table also keeps large allowlists out of SQLite's parameter limit.
+        let scoped = paths != nil
+        if scoped {
+            try store.db.execute("CREATE TEMP TABLE IF NOT EXISTS search_scope(file INTEGER PRIMARY KEY); DELETE FROM search_scope;")
+            for file in selected ?? [] where allowed(file) {
+                try store.db.run("INSERT INTO search_scope VALUES(?)", [.int(file)])
+            }
+        }
+        let scopeSQL = scoped ? " AND s.file IN (SELECT file FROM search_scope)" : ""
 
         // Meaning: score every vector on this query's scale (`meaning`), keep each file's best segment.
         var best: [Int64: (z: Double, cosine: Double, row: Int)] = [:]
         if let query = queryVector, query.count == Vectors.dimension, !rowFile.isEmpty {
             let scores = score(query)
-            let meaning = Self.meaning(scores, rowModality, setsScale: rowSetsScale)
+            let scale = scoped ? rowSetsScale.enumerated().map { $0.element && allowed(rowFile[$0.offset]) } : rowSetsScale
+            let meaning = Self.meaning(scores, rowModality, setsScale: scale)
             for row in 0..<scores.count where allowed(rowFile[row]) {
                 let z = meaning[row]
                 if z > (best[rowFile[row]]?.z ?? -.infinity) { best[rowFile[row]] = (z, Double(scores[row]), row) }
@@ -144,7 +163,7 @@ public final class Searcher {
         // many words to stand for one.
         if identifier == nil {
             for index in terms.indices where terms[index].count >= 3 && !patterns[index].hasSuffix("*") {
-                if try !isIndexed(patterns[index]) { patterns[index] += "*" }
+                if try !isIndexed(patterns[index], scoped: scoped) { patterns[index] += "*" }
             }
         }
         if !patterns.isEmpty {
@@ -152,7 +171,7 @@ public final class Searcher {
             try store.db.query("""
                 SELECT s.file, s.id, snippet(fts, 1, '«', '»', '…', 12), fts.original FROM fts
                 JOIN segments s ON s.id = fts.rowid
-                WHERE fts MATCH ? ORDER BY bm25(fts, 3.0, 1.0) LIMIT 1000
+                WHERE fts MATCH ? \(scopeSQL) ORDER BY bm25(fts, 3.0, 1.0) LIMIT 1000
                 """, [.text(patterns.joined(separator: " OR "))]) { row in
                 let file = row.int(0)
                 guard words.count < 100, allowed(file), seen.insert(file).inserted else { return }
@@ -399,9 +418,11 @@ public final class Searcher {
     }
 
     /// Whether keyword search finds `pattern` in any file.
-    private func isIndexed(_ pattern: String) throws -> Bool {
+    private func isIndexed(_ pattern: String, scoped: Bool = false) throws -> Bool {
         var found = false
-        try store.db.query("SELECT 1 FROM fts WHERE fts MATCH ? LIMIT 1", [.text(pattern)]) { _ in found = true }
+        let scopeSQL = scoped ? " AND s.file IN (SELECT file FROM search_scope)" : ""
+        try store.db.query("SELECT 1 FROM fts JOIN segments s ON s.id = fts.rowid WHERE fts MATCH ? \(scopeSQL) LIMIT 1",
+                           [.text(pattern)]) { _ in found = true }
         return found
     }
 

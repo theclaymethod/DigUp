@@ -1,5 +1,6 @@
 // swift-tools-version: 6.2
 import PackageDescription
+import Foundation
 
 // DigUp builds on macOS (the app, the CLI and its helpers) and, since the port, the engine and the CLI on
 // Linux and Windows too. The manifest picks each platform's pieces: how llama.cpp is linked, the C libraries the engine
@@ -50,12 +51,13 @@ let portableTargets: [Target] = [
 #endif
 
 #if os(macOS)
-let appProducts: [Product] = [.executable(name: "DigUpApp", targets: ["DigUpApp"])]
-let appDependencies: [Package.Dependency] = [
+let headless = ProcessInfo.processInfo.environment["DIGUP_HEADLESS"] == "1"
+let appProducts: [Product] = headless ? [] : [.executable(name: "DigUpApp", targets: ["DigUpApp"])]
+let appDependencies: [Package.Dependency] = headless ? [] : [
     // In-app updates (the app only). build.sh embeds the framework in Contents/Frameworks and signs it.
     .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0"),
 ]
-let appTargets: [Target] = [
+let appTargets: [Target] = headless ? [] : [
     // The menubar + hotkey app. build.sh wraps it into build.noindex/DigUp.app. (The product can't be called
     // "DigUp": on a case-insensitive disk it would collide with the `digup` CLI binary.)
     .executableTarget(
