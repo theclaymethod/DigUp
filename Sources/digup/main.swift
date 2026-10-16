@@ -2,6 +2,11 @@ import DigUpKit
 import Foundation
 import LlamaRuntime
 
+if CommandLine.arguments.dropFirst().first == "media-tool" {
+    exit(MediaTool.supervise(Array(CommandLine.arguments.dropFirst(2))))
+}
+if let executable = Bundle.main.executableURL { MediaTool.configureSupervisor(executable.path) }
+
 // DigUp's developer CLI. Every command works on an explicit index folder, so tests never touch the real one.
 
 #if !os(Windows)

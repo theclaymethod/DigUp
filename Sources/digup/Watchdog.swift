@@ -35,7 +35,7 @@ final class Watchdog: @unchecked Sendable {
             while true {
                 Thread.sleep(forTimeInterval: 1)
                 let reading = Indexer.nowReading
-                if let footprint = Self.footprint(), footprint > memoryLimit {
+                if let footprint = Self.footprint(), footprint + MediaTool.childMemoryBytes() > memoryLimit {
                     stop(reading?.path, why: "needed more than \(Self.size(memoryLimit)) of memory to read")
                 }
                 if let reading, Date().timeIntervalSince(reading.since) > timeLimit {

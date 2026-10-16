@@ -340,7 +340,8 @@ public final class IndexStore {
     public func unfinished() throws -> [FileRecord] {
         var out: [FileRecord] = []
         try db.query("""
-            SELECT \(Self.fileColumns) FROM files WHERE state = 'partial'\(scopeSQL)
+            SELECT \(Self.fileColumns) FROM files WHERE state = 'partial'
+                AND kind IN ('pdf', 'doc') AND json_extract(info, '$.media_reader') IS NULL\(scopeSQL)
             ORDER BY \(FileKind.indexingOrderSQL), mtime DESC
             """, scopeValues) { out.append(Self.record($0)) }
         return out
@@ -352,7 +353,8 @@ public final class IndexStore {
         try db.query("""
             SELECT COUNT(*), SUM(MAX(0, CAST(json_extract(info, '$.read_end') AS INTEGER)
                                       - CAST(json_extract(info, '$.read_to') AS INTEGER)))
-            FROM files WHERE state = 'partial'\(scopeSQL)
+            FROM files WHERE state = 'partial'
+                AND kind IN ('pdf', 'doc') AND json_extract(info, '$.media_reader') IS NULL\(scopeSQL)
             """, scopeValues) { count = (Int($0.int(0)), Int($0.int(1))) }
         return count
     }

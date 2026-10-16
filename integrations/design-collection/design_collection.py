@@ -20,7 +20,7 @@ import time
 from urllib.parse import urlsplit
 
 REPO = Path(__file__).resolve().parents[2]
-MEDIA = set('png jpg jpeg webp gif heic heif avif tiff tif bmp svg pdf txt text md markdown rtf doc docx odt html htm mp4 mov m4v webm mkv avi mp3 wav m4a aac ogg flac opus'.split())
+MEDIA = set('png jpg jpeg webp gif heic heif avif tiff tif bmp svg pdf txt text md markdown rtf doc docx odt html htm srt vtt mp4 mov m4v webm mkv avi mp3 wav m4a aac ogg flac opus'.split())
 IMAGES = set('png jpg jpeg webp gif heic heif avif tiff tif bmp svg'.split())
 CODE = set('py swift ts tsx js jsx mjs cjs mts c h cpp cc hpp m mm rs go java kt dart vue svelte css scss sass glsl wgsl metal hlsl sh bash sql ipynb'.split())
 SKIP = set('node_modules Pods .git .venv venv build dist .expo .cache __pycache__ DerivedData vendor Vendor third_party target coverage'.split())
@@ -254,22 +254,50 @@ class Collection:
             return {'files': 0, 'vectors': 0, 'pending': 0, 'failed': 0, 'unfinished': 0}
         with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=5) as db:
             states = dict(db.execute('SELECT state,COUNT(*) FROM files GROUP BY state'))
+            media = {'transcription': {}, 'captions': {}}
+            for kind, raw in db.execute('SELECT kind,info FROM files'):
+                try:
+                    info = json.loads(raw or '{}')
+                except (ValueError, TypeError):
+                    info = {}
+                if not isinstance(info, dict):
+                    info = {}
+                for category, key, allowed in (
+                    ('transcription', 'transcript_status', {'transcribed', 'no_speech', 'no_audio', 'unavailable', 'failed', 'partial'}),
+                    ('captions', 'captions_status', {'extracted', 'none', 'unavailable', 'failed', 'partial'}),
+                ):
+                    if kind not in {'audio', 'video'} and key not in info:
+                        continue
+                    value = info.get(key)
+                    value = value if isinstance(value, str) and value in allowed else 'not_reported'
+                    media[category][value] = media[category].get(value, 0) + 1
             return {'files': sum(states.values()), 'vectors': db.execute('SELECT COUNT(*) FROM segments WHERE vec IS NOT NULL').fetchone()[0],
                     'pending': states.get('pending', 0), 'failed': states.get('failed', 0),
-                    'unfinished': states.get('partial', 0), 'states': states}
+                    'unfinished': states.get('partial', 0), 'states': states, 'media': media}
+
+    def source_stale(self, info, current):
+        """Compare a snapshot with its canonical source without discarding last-known results."""
+        entry = current.get(info['entry'])
+        if entry is None:
+            return True
+        try:
+            if info['metadata']:
+                return hashlib.sha256(metadata(self.root, entry, public=info['lane'] == 'public')).hexdigest() != info['sha']
+            source = safe_file(self.root / 'entries' / info['entry'], info['source'])
+            return not source.is_file() or stamp(source) != info['stamp']
+        except (OSError, ValueError):
+            return True
 
     def status(self):
         state = read(self.manifest, {})
-        current = {e['id']: e['_manifest'] for e in catalog(self.root)}
+        current = {e['id']: e for e in catalog(self.root)}
         counts = self.counts()
         receipt = read(self.index / 'receipt.json', {})
         code = self.counts(code=True)
-        changed_sources = any(not safe_file(self.root / 'entries' / info['entry'], info['source']).exists()
-                              or stamp(safe_file(self.root / 'entries' / info['entry'], info['source'])) != info['stamp']
-                              for info in state.get('files', {}).values() if not info['metadata'])
+        changed_sources = any(self.source_stale(info, current) for info in state.get('files', {}).values())
         return {'engine': 'digup', 'ready': bool(counts['vectors']), **counts, 'code': code,
                 'entries': len(current), 'generation': state.get('generation'),
-                'stale': changed_sources or current != state.get('entries') or receipt.get('generation') != state.get('generation'),
+                'stale': changed_sources or {ident: entry['_manifest'] for ident, entry in current.items()} != state.get('entries') or receipt.get('generation') != state.get('generation'),
                 'receipt': receipt, 'reason': None if counts['vectors'] else 'Run the design collection index command.'}
 
     def index_all(self, limit=None):
@@ -439,6 +467,7 @@ class Collection:
             if mode == 'semantic' and not reply.get('meaning'):
                 raise ValueError('DigUp query encoder is unavailable')
             results = {}
+            stale_sources = {}
             for hit in reply.get('hits', []):
                 info = files.get(hit.get('path'))
                 if info is None:
@@ -448,24 +477,37 @@ class Collection:
                 loc = {'kind': 'frame' if segment == 'frame' else segment, 'source': info['source']}
                 if segment in {'audio', 'frame'}:
                     loc['seconds'] = hit.get('loc')
+                    if hit.get('loc') is not None:
+                        loc['start'] = hit['loc']
+                    if hit.get('loc_end') is not None:
+                        loc['end'] = hit['loc_end']
                 elif segment in {'page', 'page_image'}:
                     loc['page'] = hit.get('loc')
                 elif segment in {'lines', 'cells'}:
                     loc.update(start=hit.get('focus') or hit.get('loc'), end=hit.get('loc_end'))
-                evidence = {'content': hit.get('excerpt', '')[:400], 'location': loc,
-                            'similarity': hit.get('cosine'), 'score': hit['score']}
+                path = hit['path']
+                if path not in stale_sources:
+                    stale_sources[path] = (current[ident]['_manifest'] != state.get('entries', {}).get(ident)
+                                           or self.source_stale(info, current))
+                evidence = {'content': (hit.get('excerpt') or '')[:400], 'location': loc,
+                            'similarity': hit.get('cosine'), 'score': hit['score'], 'stale': stale_sources[path]}
                 lane = 'image' if segment in {'image', 'frame', 'page_image'} else 'audio' if segment == 'audio' else 'text'
                 result = results.setdefault(ident, {'id': ident, 'score': hit['score'], 'matches': {}})
                 result['matches'].setdefault(lane, evidence)
             ranked = list(results.values())[:limit]
+            stale = any(evidence['stale'] for result in ranked for evidence in result['matches'].values())
+            for result in ranked:
+                result['stale'] = any(evidence['stale'] for evidence in result['matches'].values())
+                if result['stale']:
+                    result['notice'] = 'Some matches use outdated source snapshots; reindex to refresh.'
             if include_entries:
                 for hit in ranked:
                     keys = ('id', 'title', 'summary', 'kind', 'tier', 'platforms', 'tags') if scope == 'public' else (
                         'id', 'title', 'summary', 'kind', 'tier', 'collection', 'platforms', 'tags', 'reuse', 'reuseEntry', 'reuseRepository')
                     hit['entry'] = {key: current[hit['id']].get(key) for key in keys}
+            notice = reply.get('warning') or (None if reply.get('meaning') or mode == 'keyword' else 'DigUp meaning search is unavailable; showing keyword matches.')
             return {'engine': 'digup', 'mode': ('semantic' if mode == 'semantic' else 'hybrid') if reply.get('meaning') else 'keyword',
-                    'results': ranked, 'ms': reply.get('ms'),
-                    'notice': reply.get('warning') or (None if reply.get('meaning') or mode == 'keyword' else 'DigUp meaning search is unavailable; showing keyword matches.')}
+                    'results': ranked, 'ms': reply.get('ms'), 'stale': stale, 'notice': notice}
 
     def extracted_text(self, scope='all', max_chars=180_000):
         """Content-only BM25 projection from the same readers; no vectors or local paths."""
@@ -478,6 +520,8 @@ class Collection:
                  (info['lane'] == 'public' and current[info['entry']].get('tier') in {'gallery', 'portfolio'}
                   and current[info['entry']]['_manifest'] == state.get('entries', {}).get(info['entry'])
                   if scope == 'public' else info['lane'] in {'media', 'code'})}
+        if scope == 'public':
+            files = {path: info for path, info in files.items() if not self.source_stale(info, current)}
         result, seen = {}, {}
         for name in ('index.sqlite', 'code.sqlite') if scope == 'all' else ('index.sqlite',):
             path = self.index / name
