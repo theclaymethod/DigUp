@@ -2,6 +2,8 @@
 
 <h1 align="center">DigUp</h1>
 
+This fork adds a [file-authored design collection integration](integrations/design-collection/README.md), shared by desktop and web, with public/private projections and filters before ranking. Upstream DigUp and its licenses are preserved.
+
 <p align="center"><b>Describe it. Dig it up.</b><br>
 Search the files on your computer by what's in them, with Google DeepMind's
 <a href="https://huggingface.co/google/embeddinggemma-2">EmbeddingGemma 2</a>.</p>

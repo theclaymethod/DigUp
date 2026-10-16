@@ -130,6 +130,7 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
             let limit = request["limit"] as? Int ?? 40
             let wantMeaning = request["meaning"] as? Bool ?? true
             let prefixLast = request["prefix_last"] as? Bool ?? false
+            let keywords = request["keywords"] as? Bool ?? true
             var paths: Set<String>?
             if let value = request["paths"] {
                 guard let values = value as? [String], values.count <= 100_000 else {
@@ -156,12 +157,12 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
             let hits: [SearchHit]
             if code {
                 guard let codeSearcher else { return ["hits": [], "strong": 0, "meaning": false] }
-                hits = try codeSearcher.search(text, queryVector: vector, limit: limit, prefixLast: prefixLast, paths: paths).filter {
+                hits = try codeSearcher.search(text, queryVector: vector, limit: limit, prefixLast: prefixLast, paths: paths, keywords: keywords).filter {
                     FolderSelection.isSearched($0.path, folders: codeRoots, skipped: codeSkipped)
                         && FileManager.default.fileExists(atPath: $0.path)
                 }
             } else {
-                hits = try searcher.search(text, queryVector: vector, kinds: kinds, limit: limit, prefixLast: prefixLast, paths: paths)
+                hits = try searcher.search(text, queryVector: vector, kinds: kinds, limit: limit, prefixLast: prefixLast, paths: paths, keywords: keywords)
                     .filter {
                         (roots.isEmpty || FolderSelection.isSearched($0.path, folders: roots, skipped: skipped))
                             && !types.contains(($0.path as NSString).pathExtension.lowercased())

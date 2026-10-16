@@ -117,7 +117,7 @@ public final class Searcher {
 
     public func search(_ text: String, queryVector: [Float]?, kinds: Set<FileKind>? = nil, limit: Int = 20,
                        zGate: Double = 2.0, wordWeight: Double? = nil, prefixLast: Bool = false,
-                       paths: Set<String>? = nil) throws -> [SearchHit] {
+                       paths: Set<String>? = nil, keywords: Bool = true) throws -> [SearchHit] {
         let wordWeight = wordWeight ?? (isCode ? Self.codeWordWeight : Self.wordWeight)
         if queryVector != nil, !vectorsLoaded { try reload() }
         let fileKind = self.fileKind
@@ -166,7 +166,7 @@ public final class Searcher {
                 if try !isIndexed(patterns[index], scoped: scoped) { patterns[index] += "*" }
             }
         }
-        if !patterns.isEmpty {
+        if keywords, !patterns.isEmpty {
             var seen = Set<Int64>()
             try store.db.query("""
                 SELECT s.file, s.id, snippet(fts, 1, '«', '»', '…', 12), fts.original FROM fts

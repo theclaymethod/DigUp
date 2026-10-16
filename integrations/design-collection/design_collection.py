@@ -61,6 +61,18 @@ def stamp(path):
     return [value.st_size, value.st_mtime_ns, value.st_ino, value.st_dev, value.st_ctime_ns]
 
 
+@contextlib.contextmanager
+def interruptible():
+    def stop(signum, frame):
+        raise KeyboardInterrupt()
+    previous = signal.signal(signal.SIGTERM, stop) if threading.current_thread() is threading.main_thread() else None
+    try:
+        yield
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
+
+
 def safe_file(folder, relative):
     rel = Path(relative)
     if rel.is_absolute() or '..' in rel.parts or not rel.parts:
@@ -261,7 +273,7 @@ class Collection:
                 'receipt': receipt, 'reason': None if counts['vectors'] else 'Run the design collection index command.'}
 
     def index_all(self, limit=None):
-        with self.writer():
+        with self.writer(), interruptible():
             prepared = self.prepare()
             save(self.index / 'receipt.json', {'status': 'running', **prepared, 'startedAt': time.time()})
             roots = [self.index / 'corpus' / lane for lane in ('media', 'public')]
@@ -304,10 +316,11 @@ class Collection:
                 incomplete = any(part[key] for part in (counts, code_counts) for key in ('pending', 'failed', 'unfinished'))
                 receipt = {'status': 'degraded' if incomplete else 'complete',
                            **prepared, **counts, 'code': code_counts, 'finishedAt': time.time()}
+                save(self.index / 'text.json', {'generation': prepared['generation'], 'entries': self.extracted_text()})
                 save(self.index / 'receipt.json', receipt)
                 return receipt
             except BaseException as error:
-                save(self.index / 'receipt.json', {'status': 'failed', **prepared, 'error': type(error).__name__, 'finishedAt': time.time()})
+                save(self.index / 'receipt.json', {'status': 'interrupted' if isinstance(error, KeyboardInterrupt) else 'failed', **prepared, 'error': type(error).__name__, 'finishedAt': time.time()})
                 raise
 
     def close(self):
@@ -406,7 +419,7 @@ class Collection:
                 self.call({'op': 'reload'})
                 self.generation = generation
             reply = self.call({'op': 'search', 'q': query, 'code': code and scope != 'public', 'meaning': mode != 'keyword',
-                               'limit': max(1, len(files)), 'paths': list(files)})
+                               'keywords': mode != 'semantic', 'limit': max(1, len(files)), 'paths': list(files)})
             if mode == 'semantic' and not reply.get('meaning'):
                 raise ValueError('DigUp query encoder is unavailable')
             results = {}
@@ -428,7 +441,7 @@ class Collection:
                 lane = 'image' if segment in {'image', 'frame', 'page_image'} else 'audio' if segment == 'audio' else 'text'
                 result = results.setdefault(ident, {'id': ident, 'score': hit['score'], 'matches': {}})
                 result['matches'].setdefault(lane, evidence)
-            return {'engine': 'digup', 'mode': 'hybrid' if reply.get('meaning') else 'keyword',
+            return {'engine': 'digup', 'mode': ('semantic' if mode == 'semantic' else 'hybrid') if reply.get('meaning') else 'keyword',
                     'results': list(results.values())[:limit], 'ms': reply.get('ms'),
                     'notice': reply.get('warning') or (None if reply.get('meaning') or mode == 'keyword' else 'DigUp meaning search is unavailable; showing keyword matches.')}
 
