@@ -346,13 +346,19 @@ class Collection:
         child, lines = self.child, self.lines
 
         def receive():
+            failure = 'exited'
             try:
                 for line in child.stdout:
-                    lines.put(json.loads(line))
-            except (ValueError, OSError):
-                pass
+                    value = json.loads(line)
+                    if not isinstance(value, dict):
+                        raise ValueError('Invalid helper response')
+                    lines.put(value)
+            except ValueError:
+                failure = 'invalid response'
+            except OSError:
+                failure = 'read failure'
             finally:
-                lines.put(None)
+                lines.put(ValueError('DigUp search helper ' + failure))
         threading.Thread(target=receive, daemon=True).start()
         ready = self.wait_for(None, ready=True)
         if 'path-scope-v1' not in ready.get('capabilities', []):
@@ -367,8 +373,9 @@ class Collection:
                 value = self.lines.get(timeout=max(.001, deadline - time.monotonic()))
             except queue.Empty:
                 break
-            if value is None:
-                raise ValueError('DigUp search helper exited')
+            if isinstance(value, Exception):
+                self.close()
+                raise value
             if ready and value.get('event') == 'ready' or not ready and value.get('id') == ident:
                 if value.get('error'):
                     raise ValueError(value['error'])
@@ -380,11 +387,15 @@ class Collection:
         self.start()
         self.serial += 1
         request = {**request, 'id': self.serial}
-        self.child.stdin.write(json.dumps(request) + '\n')
-        self.child.stdin.flush()
+        try:
+            self.child.stdin.write(json.dumps(request) + '\n')
+            self.child.stdin.flush()
+        except OSError:
+            self.close()
+            raise ValueError('DigUp search helper write failure') from None
         return self.wait_for(self.serial)
 
-    def search(self, records, query, *, mode='hybrid', collection='', platform='', tag='', kind='', tier='', limit=30, scope='all'):
+    def search(self, records=None, query='', *, mode='hybrid', collection='', platform='', tag='', kind='', tier='', limit=30, scope='all', include_entries=False):
         if mode not in {'hybrid', 'semantic', 'keyword'} or scope not in {'all', 'public'}:
             raise ValueError('Invalid search mode or scope')
         if not isinstance(query, str) or len(query) > 500:
@@ -393,12 +404,14 @@ class Collection:
             state = read(self.manifest, {})
             # Intersect caller eligibility with current canonical visibility, not stale snapshot metadata.
             current = {e['id']: e for e in catalog(self.root)}
-            eligible = {e['id'] for e in records if e['id'] in current
-                        and (not collection or current[e['id']].get('collection') == collection)
-                        and (not platform or platform in current[e['id']].get('platforms', []))
-                        and (not tag or tag in current[e['id']].get('tags', []))
-                        and (not kind or current[e['id']].get('kind') == kind)
-                        and (not tier or current[e['id']].get('tier', 'private') == tier)}
+            requested = current.keys() if records is None else {e['id'] for e in records}
+            eligible = {ident for ident in requested if ident in current
+                        and (scope != 'public' or current[ident].get('tier', 'private') in {'gallery', 'portfolio'})
+                        and (not collection or ('Other' if scope == 'public' else current[ident].get('collection') or 'Other') == collection)
+                        and (not platform or platform in current[ident].get('platforms', []))
+                        and (not tag or tag in current[ident].get('tags', []))
+                        and (not kind or current[ident].get('kind') == kind)
+                        and (not tier or current[ident].get('tier', 'private') == tier)}
             code = query.lstrip().lower().startswith('code:')
             if code:
                 query = query.lstrip()[5:].strip()
@@ -407,8 +420,11 @@ class Collection:
             files = {path: info for path, info in state.get('files', {}).items() if info['entry'] in eligible
                      and ((info['lane'] == 'public' and info['entry'] in public_ids) if scope == 'public'
                           else info['lane'] == ('code' if code else 'media'))}
-            if not query.strip() or not files:
+            if not query.strip() or not eligible:
                 return {'engine': 'digup', 'mode': mode, 'results': []}
+            if not files:
+                return {'engine': 'digup', 'mode': 'keyword', 'results': [],
+                        'notice': 'No native files are indexed for this selection.'}
             # The persistent helper observes newly committed files after each successful or interrupted index run.
             db = self.index / ('code.sqlite' if code else 'index.sqlite')
             wal = Path(str(db) + '-wal')
@@ -441,8 +457,14 @@ class Collection:
                 lane = 'image' if segment in {'image', 'frame', 'page_image'} else 'audio' if segment == 'audio' else 'text'
                 result = results.setdefault(ident, {'id': ident, 'score': hit['score'], 'matches': {}})
                 result['matches'].setdefault(lane, evidence)
+            ranked = list(results.values())[:limit]
+            if include_entries:
+                for hit in ranked:
+                    keys = ('id', 'title', 'summary', 'kind', 'tier', 'platforms', 'tags') if scope == 'public' else (
+                        'id', 'title', 'summary', 'kind', 'tier', 'collection', 'platforms', 'tags', 'reuse', 'reuseEntry', 'reuseRepository')
+                    hit['entry'] = {key: current[hit['id']].get(key) for key in keys}
             return {'engine': 'digup', 'mode': ('semantic' if mode == 'semantic' else 'hybrid') if reply.get('meaning') else 'keyword',
-                    'results': list(results.values())[:limit], 'ms': reply.get('ms'),
+                    'results': ranked, 'ms': reply.get('ms'),
                     'notice': reply.get('warning') or (None if reply.get('meaning') or mode == 'keyword' else 'DigUp meaning search is unavailable; showing keyword matches.')}
 
     def extracted_text(self, scope='all', max_chars=180_000):
@@ -503,7 +525,7 @@ def main():
         elif args.command == 'status':
             result = library.status()
         elif args.command == 'search':
-            result = library.search(catalog(library.root), args.query, mode=args.mode, scope=args.scope,
+            result = library.search(query=args.query, mode=args.mode, scope=args.scope,
                                     collection=args.collection, tag=args.tag)
         else:
             for line in sys.stdin:
@@ -518,7 +540,7 @@ def main():
                         fields = {key: request.get(key, '') for key in ('collection', 'platform', 'tag', 'kind', 'tier')}
                         if any(not isinstance(v, str) for v in fields.values()):
                             raise ValueError('Invalid filter')
-                        result = library.search(catalog(library.root), request.get('q', ''), **fields,
+                        result = library.search(query=request.get('q', ''), **fields,
                                                 scope=request.get('scope', 'all'), limit=200)
                     else:
                         raise ValueError('Unknown operation')
