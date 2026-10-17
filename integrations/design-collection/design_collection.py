@@ -148,6 +148,7 @@ class Collection:
         if not (code / '.git').is_dir():
             subprocess.run(['git', 'init', '--quiet', str(code)], check=True, stdout=subprocess.DEVNULL)
         self.manifest = self.index / 'collection.json'
+        self.indexed = self.index / 'indexed.json'
         self.child = None
         self.lines = queue.Queue()
         self.serial = 0
@@ -169,6 +170,10 @@ class Collection:
     def prepare(self):
         previous = read(self.manifest, {})
         known = previous.get('files', {})
+        if previous.get('version') == 1 and not self.indexed.exists():
+            self.save_indexed({path: {**info, 'legacy': True} for path, info in known.items()
+                               if info['lane'] != 'public'})
+        by_source = {self.logical(info): (path, info) for path, info in known.items()}
         records = catalog(self.root)
         files = {}
         changed = 0
@@ -181,34 +186,37 @@ class Collection:
             name = Path(rel)
             if source and source.suffix.lower().lstrip('.') in IMAGES:
                 name = name.with_name('Screenshot-' + name.name)
-            # Do not put package markers into the derived corpus: DigUp correctly skips project assets by default.
-            target = self.index / 'corpus' / lane / entry['id'] / ('metadata' if payload is not None else 'files') / name
-            key = str(target)
-            old = known.get(key, {})
-            if source:
-                before = stamp(source)
-                sha = old.get('sha') if old.get('stamp') == before and target.exists() else digest(source)
-                if old.get('sha') != sha or not target.exists():
-                    fd, temp = tempfile.mkstemp(dir=self.index)
-                    try:
-                        os.close(fd)
-                        shutil.copy2(source, temp)
-                        if digest(Path(temp)) != sha or stamp(source) != before:
-                            raise ValueError('Source changed during capture; rerun prepare')
-                        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                        os.chmod(temp, 0o600)
-                        os.replace(temp, target)
-                    finally:
-                        Path(temp).unlink(missing_ok=True)
-                    changed += 1
+            info = {'entry': entry['id'], 'source': rel if source else 'entry.json',
+                    'lane': lane, 'metadata': payload is not None, 'manifest': entry['_manifest']}
+            old_path, old = by_source.get(self.logical(info), (None, {}))
+            before = stamp(source) if source else None
+            # A full source stamp is a fast reuse guard, never evidence that native rows advanced.
+            reuse = source and old.get('stamp') == before and old_path and Path(old_path).is_file()
+            sha = old['sha'] if reuse else digest(source) if source else hashlib.sha256(payload).hexdigest()
+            target = self.index / 'corpus' / lane / entry['id'] / ('metadata' if payload is not None else 'files') / sha / name
+            self.snapshot_path(str(target), {**info, 'sha': sha})
+            if target.exists():
+                if digest(target) != sha:
+                    raise ValueError('Corrupt content-addressed snapshot; rebuild this derived index')
+            elif source:
+                fd, temp = tempfile.mkstemp(dir=self.index)
+                try:
+                    os.close(fd)
+                    shutil.copy2(source, temp)
+                    if digest(Path(temp)) != sha or safe_file(folder, rel) != source or stamp(source) != before:
+                        raise ValueError('Source changed during capture; rerun prepare')
+                    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    os.chmod(temp, 0o600)
+                    os.replace(temp, target)
+                finally:
+                    Path(temp).unlink(missing_ok=True)
+                changed += 1
             else:
-                sha = hashlib.sha256(payload).hexdigest()
-                before = None
-                if old.get('sha') != sha or not target.exists():
-                    atomic(target, payload)
-                    changed += 1
-            files[key] = {'entry': entry['id'], 'source': rel if source else 'entry.json',
-                          'lane': lane, 'sha': sha, 'stamp': before, 'metadata': payload is not None}
+                atomic(target, payload)
+                changed += 1
+            if source and (safe_file(folder, rel) != source or stamp(source) != before):
+                raise ValueError('Source changed during capture; rerun prepare')
+            files[str(target)] = {**info, 'sha': sha, 'stamp': before}
 
         for entry in records:
             folder = self.root / 'entries' / entry['id']
@@ -232,16 +240,95 @@ class Collection:
                         raise ValueError('Selected public file is missing')
                     if source.suffix.lower().lstrip('.') in MEDIA | CODE:
                         put(entry, rel, public=True)
-        # Retired files may still have vectors until sync; query allowlists already exclude them.
-        for path in (self.index / 'corpus').rglob('*'):
-            if path.is_file() and '.git' not in path.relative_to(self.index / 'corpus').parts and str(path) not in files:
-                path.unlink(missing_ok=True)
-        state = {'version': 1, 'root': str(self.root), 'files': files,
+        # Prepare records desired work only. Indexed revisions survive until native replacement succeeds.
+        state = {'version': 2, 'root': str(self.root), 'files': files,
                  'entries': {e['id']: e['_manifest'] for e in records}}
         state['generation'] = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
         save(self.manifest, state)
         return {'entries': len(records), 'files': len(files), 'changed': changed,
                 'removed': len(known.keys() - files.keys()), 'generation': state['generation']}
+
+    @staticmethod
+    def logical(info):
+        return info['lane'], info['entry'], info['source'], info['metadata']
+
+    def snapshot_path(self, path, info):
+        """Validate derived identities without following symlinks outside the corpus."""
+        corpus = self.index / 'corpus'
+        relative = Path(path).relative_to(corpus)
+        expected = (info['lane'], info['entry'], 'metadata' if info['metadata'] else 'files', info['sha'])
+        if tuple(relative.parts[:4]) != expected or not re.fullmatch(r'[0-9a-f]{64}', info['sha']):
+            raise ValueError('Invalid content-addressed snapshot')
+        return safe_file(corpus, relative)
+
+    def provenance(self):
+        """Read one desired/indexed pair per request; legacy data is private and explicitly stale."""
+        desired = read(self.manifest, {})
+        indexed = read(self.indexed, {})
+        if indexed and indexed.get('root') != str(self.root):
+            raise ValueError('Indexed provenance belongs to another collection')
+        legacy = desired.get('version') != 2 or indexed.get('version') != 1
+        files = indexed.get('files', desired.get('files', {}) if desired.get('version') == 1 else {})
+        return desired, indexed, files, legacy
+
+    def eligible_files(self, desired, indexed_files, legacy, current, eligible, scope, lanes):
+        files, stale = {}, {}
+        for path, info in indexed_files.items():
+            ident = info['entry']
+            if ident not in eligible or info['lane'] not in lanes:
+                continue
+            fresh = (not legacy and not info.get('legacy') and desired.get('files', {}).get(path) == info
+                     and current[ident]['_manifest'] == info.get('manifest')
+                     and not self.source_stale(info, current))
+            if scope == 'public' and (not fresh or current[ident].get('tier') not in {'gallery', 'portfolio'}):
+                continue
+            files[path] = info
+            stale[path] = not fresh
+        return files, stale
+
+    def reconcile(self):
+        """Activate only usable native rows at verified immutable paths; caller holds writer lock."""
+        desired, previous, old_files, legacy = self.provenance()
+        desired_keys = {self.logical(info) for info in desired.get('files', {}).values()}
+        revisions = {self.logical(info): (path, info) for path, info in old_files.items()}
+        # Keep the last usable private revision during failed refreshes. Revoked public sources need no fallback.
+        revisions = {key: (path, info) for key, (path, info) in revisions.items()
+                     if info['entry'] in desired.get('entries', {})
+                     and (info['lane'] != 'public' or key in desired_keys)}
+        usable = set()
+        for name in ('index.sqlite', 'code.sqlite'):
+            database = self.index / name
+            if not database.exists():
+                continue
+            with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=5) as db:
+                usable.update(row[0] for row in db.execute("""
+                    SELECT f.path FROM files f WHERE f.state IN ('done','partial') AND EXISTS (
+                        SELECT 1 FROM segments s LEFT JOIN fts ON fts.rowid=s.id
+                        WHERE s.file=f.id AND s.kind!='name'
+                          AND (s.vec IS NOT NULL OR length(coalesce(fts.original,fts.body,''))>0))
+                    """))
+        for path, info in desired.get('files', {}).items():
+            if path not in usable:
+                continue
+            target = self.snapshot_path(path, info)
+            if not target.is_file() or digest(target) != info['sha']:
+                raise ValueError('Indexed snapshot no longer matches its content identity')
+            revisions[self.logical(info)] = (path, info)
+        files = dict(revisions.values())
+        state = self.save_indexed(files)
+        # Commit provenance before collection-owned garbage collection; never delete authored files or SQLite rows.
+        keep = set(files) | set(desired.get('files', {}))
+        corpus = self.index / 'corpus'
+        for path in corpus.rglob('*'):
+            if '.git' not in path.relative_to(corpus).parts and path.is_file() and str(path) not in keep:
+                path.unlink()
+        return state
+
+    def save_indexed(self, files):
+        state = {'version': 1, 'root': str(self.root), 'files': files}
+        state['generation'] = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
+        save(self.indexed, state)
+        return state
 
     def command(self, operation):
         if not self.binary.is_file() or not os.access(self.binary, os.X_OK):
@@ -289,16 +376,21 @@ class Collection:
             return True
 
     def status(self):
-        state = read(self.manifest, {})
+        state, indexed, files, legacy = self.provenance()
         current = {e['id']: e for e in catalog(self.root)}
         counts = self.counts()
         receipt = read(self.index / 'receipt.json', {})
         code = self.counts(code=True)
-        changed_sources = any(self.source_stale(info, current) for info in state.get('files', {}).values())
+        changed_sources = any(self.source_stale(info, current) for info in files.values())
         return {'engine': 'digup', 'ready': bool(counts['vectors']), **counts, 'code': code,
                 'entries': len(current), 'generation': state.get('generation'),
-                'stale': changed_sources or {ident: entry['_manifest'] for ident, entry in current.items()} != state.get('entries') or receipt.get('generation') != state.get('generation'),
-                'receipt': receipt, 'reason': None if counts['vectors'] else 'Run the design collection index command.'}
+                'indexedGeneration': indexed.get('generation'),
+                'rebuildRequired': legacy or any(info.get('legacy') for info in files.values()),
+                'stale': legacy or changed_sources or files != state.get('files', {})
+                    or {ident: entry['_manifest'] for ident, entry in current.items()} != state.get('entries')
+                    or receipt.get('generation') != state.get('generation'),
+                'receipt': receipt, 'reason': 'Reindex to establish content-addressed provenance.' if legacy else
+                    None if counts['vectors'] else 'Run the design collection index command.'}
 
     def index_all(self, limit=None):
         with self.writer(), interruptible():
@@ -309,13 +401,13 @@ class Collection:
                 root.mkdir(parents=True, exist_ok=True, mode=0o700)
             code = self.index / 'corpus/code'
             code.mkdir(parents=True, exist_ok=True, mode=0o700)
-            commands = [self.command('index-service') + [str(p) for p in roots] +
-                        ['--include-datasets', '--include-code', '--code-root', str(code), '--backfill', '--prune',
-                         '--memory-limit', '4096', '--time-limit', '180', '--linger', '0']]
-            if limit is not None:
-                commands = [self.command('index') + [str(p) for p in roots] + ['--include-datasets', '--include-code', '--limit', str(limit)],
-                            self.command('index') + [str(code), '--code', '--limit', str(limit)]]
             try:
+                commands = [self.command('index-service') + [str(p) for p in roots] +
+                            ['--include-datasets', '--include-code', '--code-root', str(code), '--backfill', '--prune',
+                             '--memory-limit', '4096', '--time-limit', '180', '--linger', '0']]
+                if limit is not None:
+                    commands = [self.command('index') + [str(p) for p in roots] + ['--include-datasets', '--include-code', '--limit', str(limit)],
+                                self.command('index') + [str(code), '--code', '--limit', str(limit)]]
                 for command in commands:
                     for attempt in range(3):
                         child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -344,11 +436,21 @@ class Collection:
                 incomplete = any(part[key] for part in (counts, code_counts) for key in ('pending', 'failed', 'unfinished'))
                 receipt = {'status': 'degraded' if incomplete else 'complete',
                            **prepared, **counts, 'code': code_counts, 'finishedAt': time.time()}
-                save(self.index / 'text.json', {'generation': prepared['generation'], 'entries': self.extracted_text()})
+                indexed = self.reconcile()
+                receipt['indexedGeneration'] = indexed['generation']
+                save(self.index / 'text.json', {'generation': prepared['generation'], 'indexedGeneration': indexed['generation'],
+                                                'entries': self.extracted_text()})
                 save(self.index / 'receipt.json', receipt)
                 return receipt
             except BaseException as error:
-                save(self.index / 'receipt.json', {'status': 'interrupted' if isinstance(error, KeyboardInterrupt) else 'failed', **prepared, 'error': type(error).__name__, 'finishedAt': time.time()})
+                failure = {'status': 'interrupted' if isinstance(error, KeyboardInterrupt) else 'failed',
+                           **prepared, 'error': type(error).__name__, 'finishedAt': time.time()}
+                try:
+                    failure['indexedGeneration'] = self.reconcile()['generation']
+                except Exception as reconcile_error:
+                    # Preserve the native/startup error and report failed provenance reconciliation separately.
+                    failure['provenanceError'] = type(reconcile_error).__name__
+                save(self.index / 'receipt.json', failure)
                 raise
 
     def close(self):
@@ -429,7 +531,7 @@ class Collection:
         if not isinstance(query, str) or len(query) > 500:
             raise ValueError('Use a query of at most 500 characters')
         with self.lock:
-            state = read(self.manifest, {})
+            state, indexed, indexed_files, legacy = self.provenance()
             # Intersect caller eligibility with current canonical visibility, not stale snapshot metadata.
             current = {e['id']: e for e in catalog(self.root)}
             requested = current.keys() if records is None else {e['id'] for e in records}
@@ -443,11 +545,8 @@ class Collection:
             code = query.lstrip().lower().startswith('code:')
             if code:
                 query = query.lstrip()[5:].strip()
-            public_ids = {ident for ident in eligible if current[ident].get('tier', 'private') in {'gallery', 'portfolio'}
-                          and current[ident]['_manifest'] == state.get('entries', {}).get(ident)}
-            files = {path: info for path, info in state.get('files', {}).items() if info['entry'] in eligible
-                     and ((info['lane'] == 'public' and info['entry'] in public_ids) if scope == 'public'
-                          else info['lane'] == ('code' if code else 'media'))}
+            files, stale_sources = self.eligible_files(state, indexed_files, legacy, current, eligible, scope,
+                {'public'} if scope == 'public' else {'code' if code else 'media'})
             if not query.strip() or not eligible:
                 return {'engine': 'digup', 'mode': mode, 'results': []}
             if not files:
@@ -456,7 +555,7 @@ class Collection:
             # The persistent helper observes newly committed files after each successful or interrupted index run.
             db = self.index / ('code.sqlite' if code else 'index.sqlite')
             wal = Path(str(db) + '-wal')
-            generation = (state.get('generation'), db.stat().st_mtime_ns if db.exists() else 0,
+            generation = (indexed.get('generation'), state.get('generation'), db.stat().st_mtime_ns if db.exists() else 0,
                           wal.stat().st_mtime_ns if wal.exists() else 0)
             self.start()
             if self.generation != generation:
@@ -467,7 +566,6 @@ class Collection:
             if mode == 'semantic' and not reply.get('meaning'):
                 raise ValueError('DigUp query encoder is unavailable')
             results = {}
-            stale_sources = {}
             for hit in reply.get('hits', []):
                 info = files.get(hit.get('path'))
                 if info is None:
@@ -486,9 +584,6 @@ class Collection:
                 elif segment in {'lines', 'cells'}:
                     loc.update(start=hit.get('focus') or hit.get('loc'), end=hit.get('loc_end'))
                 path = hit['path']
-                if path not in stale_sources:
-                    stale_sources[path] = (current[ident]['_manifest'] != state.get('entries', {}).get(ident)
-                                           or self.source_stale(info, current))
                 evidence = {'content': (hit.get('excerpt') or '')[:400], 'location': loc,
                             'similarity': hit.get('cosine'), 'score': hit['score'], 'stale': stale_sources[path]}
                 lane = 'image' if segment in {'image', 'frame', 'page_image'} else 'audio' if segment == 'audio' else 'text'
@@ -513,15 +608,10 @@ class Collection:
         """Content-only BM25 projection from the same readers; no vectors or local paths."""
         if scope not in {'all', 'public'}:
             raise ValueError('Invalid scope')
-        state = read(self.manifest, {})
+        state, indexed, indexed_files, legacy = self.provenance()
         current = {e['id']: e for e in catalog(self.root)}
-        files = {path: info for path, info in state.get('files', {}).items()
-                 if info['entry'] in current and
-                 (info['lane'] == 'public' and current[info['entry']].get('tier') in {'gallery', 'portfolio'}
-                  and current[info['entry']]['_manifest'] == state.get('entries', {}).get(info['entry'])
-                  if scope == 'public' else info['lane'] in {'media', 'code'})}
-        if scope == 'public':
-            files = {path: info for path, info in files.items() if not self.source_stale(info, current)}
+        files, _ = self.eligible_files(state, indexed_files, legacy, current, current.keys(), scope,
+                                      {'public'} if scope == 'public' else {'media', 'code'})
         result, seen = {}, {}
         for name in ('index.sqlite', 'code.sqlite') if scope == 'all' else ('index.sqlite',):
             path = self.index / name

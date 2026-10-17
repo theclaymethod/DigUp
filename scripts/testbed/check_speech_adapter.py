@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -42,7 +43,13 @@ def main():
         (entry / "assets").mkdir(parents=True)
         shutil.copy2(args.media / "delayed.mp4", entry / "assets/selected.mp4")
         shutil.copy2(args.media / "captions.srt", entry / "assets/unselected.srt")
-        manifest = {"title": "Neutral media", "tier": "gallery", "publish": {"files": ["assets/selected.mp4"]}}
+        revision = entry / "assets/revision.vtt"
+        text_a = "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nAn indigo marker is drawn.\n"
+        text_b = text_a.replace("indigo marker", "orange banner")
+        assert len(text_a.encode()) == len(text_b.encode())
+        revision.write_text(text_a)
+        manifest = {"title": "Neutral media", "tier": "gallery", "publish": {
+            "files": ["assets/selected.mp4", "assets/revision.vtt"]}}
         adapter.save(entry / "entry.json", manifest)
         library = adapter.Collection(root, binary=args.binary)
         checks = {}
@@ -75,6 +82,52 @@ def main():
                 "telescope" in all_text.get("demo", "").lower()
             checks["public_text_exact_selection"] = "compass" in public_text.get("demo", "").lower() and \
                 "telescope" not in public_text.get("demo", "").lower()
+
+            first_state = adapter.read(library.manifest)
+            first_paths = {path for path, info in first_state["files"].items()
+                           if info["source"] == "assets/revision.vtt"}
+            checks["revision_a_native_public_search"] = bool(library.search(
+                query="indigo marker", mode="keyword", scope="public")["results"])
+            checks["revision_a_native_public_text"] = "indigo marker" in library.extracted_text(scope="public").get("demo", "")
+            before = revision.stat()
+            revision.write_text(text_b)
+            os.utime(revision, ns=(before.st_atime_ns, before.st_mtime_ns))
+            with library.writer():
+                library.prepare()
+            prepared = adapter.read(library.manifest)
+            next_paths = {path for path, info in prepared["files"].items()
+                          if info["source"] == "assets/revision.vtt"}
+            checks["same_size_mtime_new_immutable_identity"] = revision.stat().st_size == before.st_size and \
+                revision.stat().st_mtime_ns == before.st_mtime_ns and first_paths.isdisjoint(next_paths)
+            gap = library.search(query="indigo marker", mode="keyword", scope="all")
+            checks["prepare_only_gap_keeps_private_a_stale"] = bool(gap["results"]) and gap["stale"] and \
+                "indigo marker" in library.extracted_text().get("demo", "")
+            gap_text = library.extracted_text(scope="public").get("demo", "")
+            checks["prepare_only_gap_excludes_public_a_and_unindexed_b"] = not library.search(
+                query="indigo marker", mode="keyword", scope="public")["results"] and \
+                "indigo marker" not in gap_text and "orange banner" not in gap_text
+            checks["old_private_capture_retained_during_gap"] = all(Path(path).is_file() for path in first_paths)
+            with contextlib.redirect_stdout(io.StringIO()):
+                replacement = library.index_all()
+            new = library.search(query="orange banner", mode="keyword", scope="public")
+            replaced_text = library.extracted_text(scope="public").get("demo", "")
+            checks["native_replacement_b_is_current"] = replacement["status"] == "complete" and \
+                bool(new["results"]) and not new["stale"] and "orange banner" in replaced_text
+            checks["native_replacement_a_is_retired"] = not library.search(
+                query="indigo marker", mode="keyword", scope="public")["results"] and \
+                "indigo marker" not in replaced_text and all(not Path(path).exists() for path in first_paths)
+            active = set(adapter.read(library.indexed)["files"])
+            with sqlite3.connect(library.index / "index.sqlite") as db:
+                indexed_before = {path: when for path, when in db.execute("SELECT path,indexed_at FROM files") if path in active}
+            with contextlib.redirect_stdout(io.StringIO()):
+                unchanged = library.index_all()
+            with sqlite3.connect(library.index / "index.sqlite") as db:
+                indexed_after = {path: when for path, when in db.execute("SELECT path,indexed_at FROM files") if path in active}
+            checks["unchanged_update_preserves_native_revisions"] = unchanged["changed"] == 0 and \
+                indexed_before == indexed_after and bool(indexed_after)
+            checks["text_projection_records_both_generations"] = adapter.read(library.index / "text.json").get("indexedGeneration") == \
+                adapter.read(library.indexed)["generation"]
+
             with (entry / "assets/selected.mp4").open("ab") as target:
                 target.write(b"\0")
             stale = library.search(query="silver compass", mode="keyword", scope="all")
