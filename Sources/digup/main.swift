@@ -725,6 +725,10 @@ do {
         print(usage)
         exit(0)
     }
+    if raw.dropFirst().contains("--help") || raw.dropFirst().contains("-h") {
+        print(usage)
+        exit(0)
+    }
     let args = try Arguments(raw.dropFirst())
     if command == "discover" { try discover(args); exit(0) }
     if ["index-service", "worker", "search-service", "download-model"].contains(command)
