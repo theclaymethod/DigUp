@@ -96,6 +96,9 @@ def catalog(root):
             raise ValueError('Invalid entry ID')
         manifest = safe_file(folder, 'entry.json')
         entry = read(manifest)
+        sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"scripts"))
+        from library_lifecycle import visible
+        if not visible(entry):continue
         if not isinstance(entry, dict) or not isinstance(entry.get('title'), str):
             raise ValueError('Invalid entry manifest: ' + folder.name)
         if entry.get('tier', 'private') not in {'private', 'gallery', 'portfolio'}:
