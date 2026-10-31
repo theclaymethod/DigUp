@@ -96,11 +96,11 @@ def catalog(root):
             raise ValueError('Invalid entry ID')
         manifest = safe_file(folder, 'entry.json')
         entry = read(manifest)
-        sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"scripts"))
-        from library_lifecycle import visible
-        if not visible(entry):continue
         if not isinstance(entry, dict) or not isinstance(entry.get('title'), str):
             raise ValueError('Invalid entry manifest: ' + folder.name)
+        state = entry.get('libraryState')
+        if state is not None and (not isinstance(state, dict) or state.get('status') != 'active'):
+            continue
         if entry.get('tier', 'private') not in {'private', 'gallery', 'portfolio'}:
             raise ValueError('Invalid visibility: ' + folder.name)
         result.append({**entry, 'id': folder.name, '_manifest': digest(manifest)})
