@@ -17,6 +17,8 @@ let usage = """
     digup: search your files by meaning (DigUp developer CLI)
 
       digup estimate <folder>... [--json]     what would be indexed, and how long the first pass takes
+      digup discover <folder>... --json      native candidates and explicit per-file policy exclusions;
+                                              metadata only, no index, estimates or model work
       digup index <folder>... [--limit N]     sync the index with these folders, embed what's new, then the rest
                                               of long PDFs and documents
       digup search <words>... [--kind K,K] [-n 10] [--json]
@@ -212,6 +214,28 @@ func makeEmbedder(textOnly: Bool, log: URL, qos: QualityOfService = .default) th
 /// `makeEmbedder`'s vector source when it's known without starting it: llama.cpp's always is.
 func embedderSource() -> String? {
     ProcessInfo.processInfo.environment["DIGUP_WORKER_DIR"] == nil ? LlamaEmbedder.modelInfo.vectorSource : nil
+}
+
+func discover(_ args: Arguments) throws {
+    let flags: Set<String> = ["--json", "--code", "--include-code", "--include-datasets"]
+    guard args.flags.contains("--json"), args.flags.isSubset(of: flags), args.values.isEmpty,
+          Set(args.lists.keys).isSubset(of: ["--exclude", "--exclude-ext"]) else {
+        throw CLIError("discover requires --json and accepts only crawl options")
+    }
+    let roots = try args.folders(), options = args.options
+    let report = Crawler.crawl(roots, options: options, reportExclusions: true)
+    emit(["version": 1, "roots": roots.map(\.path),
+          "options": ["code": options.code, "includeCode": options.includeCode,
+                      "includeDatasets": options.includeDatasets, "excludedFolders": options.excludedFolders,
+                      "excludedExtensions": options.excludedExtensions.sorted(), "maxCodeBytes": options.maxCodeBytes,
+                      "maxNotebookBytes": options.maxNotebookBytes] as [String: Any],
+          "candidates": report.candidates.map {
+              ["path": $0.path, "kind": $0.kind.rawValue, "size": $0.size, "mtime": $0.mtime,
+               "inode": $0.inode, "device": $0.device] as [String: Any]
+          }, "excluded": report.exclusions.map {
+              ["path": $0.path, "reason": $0.reason, "size": $0.size, "mtime": $0.mtime,
+               "inode": $0.inode, "device": $0.device] as [String: Any]
+          }])
 }
 
 func estimate(_ args: Arguments) throws {
@@ -702,6 +726,7 @@ do {
         exit(0)
     }
     let args = try Arguments(raw.dropFirst())
+    if command == "discover" { try discover(args); exit(0) }
     if ["index-service", "worker", "search-service", "download-model"].contains(command)
         || command == "estimate" && args.flags.contains("--json") {
         ParentWatch.start()   // an app's helper goes when the app does

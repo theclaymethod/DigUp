@@ -215,8 +215,22 @@ import Testing
         try write("loose/backup.sh", "rsync\n")                // not in a repo: everything code counts
         try git("init", "-q", "app")
         #expect(crawlNames(codeOptions) == ["app/README.md", "app/main.py", "app/notes/todo.md", "loose/backup.sh"])
-        let report = Crawler.crawl([folder], options: codeOptions)
+        let report = Crawler.crawl([folder], options: codeOptions, reportExclusions: true)
         #expect(report.skipped["ignored by git"] == 1)
+        let exclusions = Dictionary(uniqueKeysWithValues: report.exclusions.map {
+            (String($0.path.dropFirst(folder.path.count + 1)), $0.reason)
+        })
+        #expect(exclusions["app/big.py"] == "too big to be written by hand")
+        #expect(exclusions["app/scratch.py"] == "ignored by git")
+        #expect(exclusions["app/data.json"] == "data file")
+        #expect(!exclusions.keys.contains("app/vendor/lib/core.py")) // unwalked is unresolved
+        #expect(Crawler.crawl([folder], options: codeOptions).exclusions.isEmpty)
+        var mainOptions = IndexOptions()
+        mainOptions.includeCode = true
+        let loose = folder.appendingPathComponent("loose")
+        try write("loose/big.py", String(repeating: "x = 1\n", count: 200_000))
+        #expect(Crawler.crawl([loose], options: mainOptions, reportExclusions: true).candidates
+            .contains { $0.path.hasSuffix("big.py") && $0.kind == .doc })
         #expect(report.skippedFolders["vendored or built code"] == 2)
         #expect(report.skippedFolders["submodule or worktree"] == 1)
         // A repo's subfolder chosen on its own still follows the repo's .gitignore.

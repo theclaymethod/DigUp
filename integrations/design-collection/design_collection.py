@@ -5,6 +5,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -25,6 +26,8 @@ IMAGES = set('png jpg jpeg webp gif heic heif avif tiff tif bmp svg'.split())
 CODE = set('py swift ts tsx js jsx mjs cjs mts c h cpp cc hpp m mm rs go java kt dart vue svelte css scss sass glsl wgsl metal hlsl sh bash sql ipynb'.split())
 SKIP = set('node_modules Pods .git .venv venv build dist .expo .cache __pycache__ DerivedData vendor Vendor third_party target coverage'.split())
 SECRET = re.compile(r'^(?:\.|secret|credential|id_rsa|id_ed25519)|\.(?:pem|key|p12|pfx|crt|cer|keystore)$', re.I)
+EXCLUSIONS = {'excluded type', 'code or data file', 'key or password file', 'minified', 'license', 'data file',
+              'too big to be written by hand', 'ignored by git', 'inside a code project', 'dataset'}
 
 
 def read(path, default=None):
@@ -296,15 +299,142 @@ class Collection:
             stale[path] = not fresh
         return files, stale
 
-    def reconcile(self):
+    def binary_digest(self):
+        before = stamp(self.binary)
+        cached = getattr(self, '_binary_digest', None)
+        if cached and cached[0] == before:
+            return cached[1]
+        sha = digest(self.binary)
+        if stamp(self.binary) != before:
+            raise ValueError('Native binary changed during discovery')
+        self._binary_digest = before, sha
+        return sha
+
+    def discover(self, limit=None):
+        """Ask the exact native crawler for exclusions, without indexing or model work."""
+        raw = self.manifest.read_bytes()
+        desired = json.loads(raw)
+        command = self.command('discover')
+        binary = self.binary_digest()
+        result = {'version': 1, 'generation': desired['generation'], 'binarySha256': binary,
+                  'limited': limit is not None, 'reports': {}, 'excluded': {}}
+        for lane, roots in (('main', ['media', 'public']), ('code', ['code'])):
+            paths = [str(self.index / 'corpus' / root) for root in roots]
+            flags = ['--json'] + (['--code'] if lane == 'code' else [])
+            if lane == 'main' or limit is None:
+                flags += ['--include-code', '--include-datasets']
+            reply = subprocess.run(command + paths + flags,
+                                   capture_output=True, timeout=120, check=True)
+            if len(reply.stdout) > 16 * 1024 * 1024:
+                raise ValueError('Native discovery report is oversized')
+            report = json.loads(reply.stdout)
+            if (not isinstance(report, dict) or set(report) != {'version', 'roots', 'options', 'candidates', 'excluded'}
+                    or type(report['version']) is not int or report['version'] != 1 or report['roots'] != paths):
+                raise ValueError('Unsupported native discovery report')
+            self.discovery_options(report['options'], lane, limit is not None)
+            seen = set()
+            for category in ('candidates', 'excluded'):
+                records = report[category]
+                if not isinstance(records, list) or len(records) > 100_000:
+                    raise ValueError('Invalid native discovery records')
+                for record in records:
+                    field = 'kind' if category == 'candidates' else 'reason'
+                    if (not isinstance(record, dict) or set(record) != {'path', field, 'size', 'mtime', 'inode', 'device'}
+                            or not isinstance(record['path'], str) or record['path'] in seen
+                            or type(record['size']) is not int or record['size'] < 0
+                            or type(record['mtime']) not in (int, float) or not math.isfinite(record['mtime'])
+                            or any(type(record[key]) is not int or record[key] < 0 for key in ('inode', 'device'))
+                            or not isinstance(record[field], str) or record[field] not in (EXCLUSIONS if category == 'excluded' else
+                                                   {'screenshot', 'image', 'pdf', 'doc', 'audio', 'video', 'code'})):
+                        raise ValueError('Invalid native discovery record')
+                    path = record['path']
+                    relative = Path(path).relative_to(self.index / 'corpus')
+                    if not relative.parts or relative.parts[0] not in roots or str(safe_file(self.index / 'corpus', relative)) != path:
+                        raise ValueError('Native discovery path escapes its lane')
+                    seen.add(path)
+                    if category == 'excluded' and path in desired['files']:
+                        result['excluded'][path] = {'info': desired['files'][path], 'reason': record['reason'],
+                                                    'stamp': [record[key] for key in ('size', 'mtime', 'inode', 'device')]}
+            result['reports'][lane] = {'roots': paths, 'options': report['options'],
+                                       'sha256': hashlib.sha256(reply.stdout).hexdigest()}
+        if self.manifest.read_bytes() != raw or self.binary_digest() != binary:
+            raise ValueError('Desired generation or native binary changed during discovery')
+        self.verified_exclusions(desired, result, verify=True)
+        return result
+
+    @staticmethod
+    def discovery_options(options, lane, limited):
+        expected = {'code': lane == 'code', 'includeCode': lane == 'main' or not limited,
+                    'includeDatasets': lane == 'main' or not limited, 'excludedFolders': [], 'excludedExtensions': []}
+        if (not isinstance(options, dict) or set(options) != set(expected) | {'maxCodeBytes', 'maxNotebookBytes'}
+                or any(options[key] != value or type(options[key]) is not type(value) for key, value in expected.items())
+                or any(type(options[key]) is not int or not 0 < options[key] <= 1 << 40
+                       for key in ('maxCodeBytes', 'maxNotebookBytes'))):
+            raise ValueError('Native discovery crawl options differ from indexing')
+
+    def verified_exclusions(self, desired, discovery, verify=False):
+        if discovery is None:
+            return {}
+        if (not isinstance(discovery, dict) or set(discovery) != {'version', 'generation', 'binarySha256', 'limited', 'reports', 'excluded'}
+                or type(discovery['version']) is not int or discovery['version'] != 1 or type(discovery['limited']) is not bool
+                or not isinstance(discovery['binarySha256'], str) or not re.fullmatch('[a-f0-9]{64}', discovery['binarySha256'])
+                or not isinstance(discovery['reports'], dict) or set(discovery['reports']) != {'main', 'code'}
+                or not isinstance(discovery['excluded'], dict) or len(discovery['excluded']) > 100_000):
+            raise ValueError('Invalid indexed discovery provenance')
+        for lane, roots in (('main', ['media', 'public']), ('code', ['code'])):
+            report = discovery['reports'][lane]
+            if (not isinstance(report, dict) or set(report) != {'roots', 'options', 'sha256'}
+                    or report['roots'] != [str(self.index / 'corpus' / root) for root in roots]
+                    or not isinstance(report['sha256'], str) or not re.fullmatch('[a-f0-9]{64}', report['sha256'])):
+                raise ValueError('Invalid indexed discovery report')
+            self.discovery_options(report['options'], lane, discovery['limited'])
+        try:
+            binary = self.binary_digest()
+        except OSError:
+            return {}
+        if discovery['generation'] != desired.get('generation') or discovery['binarySha256'] != binary:
+            return {}
+        current = {entry['id']: entry for entry in catalog(self.root)}
+        excluded = {}
+        for path, record in discovery['excluded'].items():
+            if (not isinstance(record, dict) or set(record) != {'info', 'reason', 'stamp'}
+                    or not isinstance(record['info'], dict) or record['info'] != desired.get('files', {}).get(path)
+                    or not isinstance(record['reason'], str) or record['reason'] not in EXCLUSIONS
+                    or not isinstance(record['stamp'], list) or len(record['stamp']) != 4
+                    or any(type(record['stamp'][i]) is not int or record['stamp'][i] < 0 for i in (0, 2, 3))
+                    or type(record['stamp'][1]) not in (int, float) or not math.isfinite(record['stamp'][1])):
+                raise ValueError('Invalid excluded snapshot provenance')
+            info = record['info']
+            target = self.snapshot_path(path, info)
+            if (current.get(info['entry'], {}).get('_manifest') != info['manifest'] or self.source_stale(info, current)):
+                if verify:
+                    raise ValueError('Excluded source changed after capture')
+                continue
+            if verify:
+                if not target.is_file():
+                    raise ValueError('Excluded snapshot is not a regular file')
+                before = stamp(target)
+                observed = [before[0], target.stat().st_mtime, before[2], before[3]]
+                captured = record['stamp']
+                if (observed[0] != captured[0] or observed[2:] != captured[2:] or abs(observed[1] - captured[1]) > 0.001
+                        or digest(target) != info['sha'] or stamp(target) != before):
+                    raise ValueError('Excluded snapshot no longer matches native discovery')
+            excluded[path] = record
+        return excluded
+
+    def reconcile(self, discovery=None):
         """Attest usable or terminal-skipped native paths; caller holds writer lock."""
         desired, previous, old_files, legacy = self.provenance()
+        discovery = previous.get('discovery') if discovery is None else discovery
+        excluded = self.verified_exclusions(desired, discovery, verify=True)
         desired_keys = {self.logical(info) for info in desired.get('files', {}).values()}
         revisions = {self.logical(info): (path, info) for path, info in old_files.items()}
         # Keep the last usable private revision during failed refreshes. Revoked public sources need no fallback.
         revisions = {key: (path, info) for key, (path, info) in revisions.items()
                      if info['entry'] in desired.get('entries', {})
                      and (info['lane'] != 'public' or key in desired_keys)}
+        for record in excluded.values():
+            revisions.pop(self.logical(record['info']), None)
         processed = set()
         for name in ('index.sqlite', 'code.sqlite'):
             database = self.index / name
@@ -318,14 +448,16 @@ class Collection:
                           AND (s.vec IS NOT NULL OR length(coalesce(fts.original,fts.body,''))>0)))
                     """))
         for path, info in desired.get('files', {}).items():
-            if path not in processed:
+            if path not in processed or path in excluded:
                 continue
             target = self.snapshot_path(path, info)
             if not target.is_file() or digest(target) != info['sha']:
                 raise ValueError('Indexed snapshot no longer matches its content identity')
             revisions[self.logical(info)] = (path, info)
         files = dict(revisions.values())
-        state = self.save_indexed(files)
+        if read(self.manifest) != desired:
+            raise ValueError('Desired generation changed during reconciliation')
+        state = self.save_indexed(files, discovery)
         # Commit provenance before collection-owned garbage collection; never delete authored files or SQLite rows.
         keep = set(files) | set(desired.get('files', {}))
         corpus = self.index / 'corpus'
@@ -334,8 +466,10 @@ class Collection:
                 path.unlink()
         return state
 
-    def save_indexed(self, files):
+    def save_indexed(self, files, discovery=None):
         state = {'version': 1, 'root': str(self.root), 'files': files}
+        if discovery is not None:
+            state['discovery'] = discovery
         state['generation'] = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
         save(self.indexed, state)
         return state
@@ -391,12 +525,16 @@ class Collection:
         counts = self.counts()
         receipt = read(self.index / 'receipt.json', {})
         code = self.counts(code=True)
-        changed_sources = any(self.source_stale(info, current) for info in files.values())
+        excluded = self.verified_exclusions(state, indexed.get('discovery'))
+        processed = {**files, **{path: record['info'] for path, record in excluded.items()}}
+        changed_sources = any(self.source_stale(info, current) for info in processed.values())
+        reasons = [record['reason'] for record in excluded.values()]
         return {'engine': 'digup', 'ready': bool(counts['vectors']), **counts, 'code': code,
                 'entries': len(current), 'generation': state.get('generation'),
                 'indexedGeneration': indexed.get('generation'),
+                'excluded': {'files': len(excluded), 'reasons': {reason: reasons.count(reason) for reason in sorted(set(reasons))}},
                 'rebuildRequired': legacy or any(info.get('legacy') for info in files.values()),
-                'stale': legacy or changed_sources or files != state.get('files', {})
+                'stale': legacy or changed_sources or processed != state.get('files', {})
                     or {ident: entry['_manifest'] for ident, entry in current.items()} != state.get('entries')
                     or receipt.get('generation') != state.get('generation'),
                 'receipt': receipt, 'reason': 'Reindex to establish content-addressed provenance.' if legacy else
@@ -411,7 +549,9 @@ class Collection:
                 root.mkdir(parents=True, exist_ok=True, mode=0o700)
             code = self.index / 'corpus/code'
             code.mkdir(parents=True, exist_ok=True, mode=0o700)
+            discovery = None
             try:
+                discovery = self.discover(limit)
                 commands = [self.command('index-service') + [str(p) for p in roots] +
                             ['--include-datasets', '--include-code', '--code-root', str(code), '--backfill', '--prune',
                              '--memory-limit', '4096', '--time-limit', '180', '--linger', '0']]
@@ -446,8 +586,10 @@ class Collection:
                 incomplete = any(part[key] for part in (counts, code_counts) for key in ('pending', 'failed', 'unfinished'))
                 receipt = {'status': 'degraded' if incomplete else 'complete',
                            **prepared, **counts, 'code': code_counts, 'finishedAt': time.time()}
-                indexed = self.reconcile()
+                indexed = self.reconcile(discovery)
                 receipt['indexedGeneration'] = indexed['generation']
+                reasons = [record['reason'] for record in discovery['excluded'].values()]
+                receipt['excluded'] = {'files': len(reasons), 'reasons': {reason: reasons.count(reason) for reason in sorted(set(reasons))}}
                 save(self.index / 'text.json', {'generation': prepared['generation'], 'indexedGeneration': indexed['generation'],
                                                 'entries': self.extracted_text()})
                 save(self.index / 'receipt.json', receipt)
@@ -456,7 +598,7 @@ class Collection:
                 failure = {'status': 'interrupted' if isinstance(error, KeyboardInterrupt) else 'failed',
                            **prepared, 'error': type(error).__name__, 'finishedAt': time.time()}
                 try:
-                    failure['indexedGeneration'] = self.reconcile()['generation']
+                    failure['indexedGeneration'] = self.reconcile(discovery)['generation']
                 except Exception as reconcile_error:
                     # Preserve the native/startup error and report failed provenance reconciliation separately.
                     failure['provenanceError'] = type(reconcile_error).__name__

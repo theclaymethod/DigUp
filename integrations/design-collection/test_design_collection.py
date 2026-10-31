@@ -388,6 +388,63 @@ class MediaEvidenceTests(unittest.TestCase):
         self.assertTrue(Path(old_path).exists())
         self.assertTrue(self.collection.status()['rebuildRequired'])
 
+        source = self.entry / 'large.py'
+        source.write_text('print("old handwritten code")\n')
+        self.manifest['publish']['files'].append('large.py')
+        adapter.save(self.entry / 'entry.json', self.manifest)
+        self.collection.prepare()
+        before = adapter.read(self.collection.manifest)
+        old_code = next(path for path, info in before['files'].items() if info['lane'] == 'code')
+        source.write_text('x' * ((1 << 20) + 1))
+        self.collection.prepare()
+        desired = adapter.read(self.collection.manifest)
+        code = next(path for path, info in desired['files'].items() if info['lane'] == 'code')
+        public = next(path for path, info in desired['files'].items()
+                      if info['lane'] == 'public' and info['source'] == 'large.py')
+        # Other current rows are controlled indexed revisions, as in setUp; only code awaits discovery.
+        self.collection.save_indexed({**{path: info for path, info in desired['files'].items() if path != code},
+                                      old_code: {**before['files'][old_code], 'legacy': True}})
+        adapter.save(self.collection.index / 'receipt.json', {'generation': desired['generation']})
+        replies = []
+        for lane, roots in (('main', ['media', 'public']), ('code', ['code'])):
+            path = public if lane == 'main' else code
+            stat = Path(path).stat()
+            record = {'path': path, 'size': stat.st_size, 'mtime': stat.st_mtime,
+                      'inode': stat.st_ino, 'device': stat.st_dev}
+            report = {'version': 1, 'roots': [str(self.collection.index / 'corpus' / root) for root in roots],
+                      'options': {'code': lane == 'code', 'includeCode': True, 'includeDatasets': True,
+                                  'excludedFolders': [], 'excludedExtensions': [],
+                                  'maxCodeBytes': 1 << 20, 'maxNotebookBytes': 20 << 20},
+                      'candidates': [{**record, 'kind': 'doc'}] if lane == 'main' else [],
+                      'excluded': [{**record, 'reason': 'too big to be written by hand'}] if lane == 'code' else []}
+            replies.append(adapter.subprocess.CompletedProcess([], 0, json.dumps(report).encode(), b''))
+        with patch.object(adapter.subprocess, 'run', side_effect=replies) as native:
+            discovery = self.collection.discover()
+        self.assertIn('--code', native.call_args_list[1].args[0])
+        self.assertNotIn('--code', native.call_args_list[0].args[0])
+        with self.collection.writer():
+            self.collection.reconcile({**discovery, 'excluded': {}})
+        self.assertIn(old_code, adapter.read(self.collection.indexed)['files'])
+        self.assertTrue(self.collection.status()['stale'])
+        with self.collection.writer():
+            self.collection.reconcile(discovery)
+        indexed = adapter.read(self.collection.indexed)
+        self.assertNotIn(old_code, indexed['files'])
+        self.assertNotIn(code, indexed['files'])
+        self.assertIn(code, indexed['discovery']['excluded'])
+        self.assertFalse(Path(old_code).exists())
+        self.assertFalse(self.collection.status()['stale'])
+        self.assertFalse(self.collection.status()['rebuildRequired'])
+        self.assertEqual(self.collection.status()['excluded'], {
+            'files': 1, 'reasons': {'too big to be written by hand': 1}})
+        self.hits = [self.hit(path=old_code), self.hit(path=code)]
+        self.assertEqual(self.collection.search(query='code: generated', mode='keyword')['results'], [])
+        self.hits = [self.hit(path=public)]
+        self.assertFalse(self.search(scope='public')['results'][0]['stale'])
+        self.manifest['publish']['files'].remove('large.py')
+        adapter.save(self.entry / 'entry.json', self.manifest)
+        self.assertEqual(self.search(scope='public')['results'], [])
+
     def test_changed_notes_policy_cannot_bless_old_metadata_after_prepare(self):
         self.manifest['publish'].update(notes=True, files=['notes.md'])
         adapter.save(self.entry / 'entry.json', self.manifest)

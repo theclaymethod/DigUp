@@ -11,7 +11,13 @@ public struct Candidate: Sendable {
 }
 
 public struct CrawlReport: Sendable {
+    public struct Exclusion: Sendable {
+        public let path: String, reason: String
+        public let size: Int64, mtime: Double, inode: UInt64, device: UInt64
+    }
     public var candidates: [Candidate] = []
+    /// Opt-in, per-file policy decisions. Missing, cloud, special and unwalked files are not exclusions.
+    public var exclusions: [Exclusion] = []
     public var skipped: [String: Int] = [:]          // reason → files
     public var skippedFolders: [String: Int] = [:]   // reason → folders not walked into
     public var datasets: [String: Int] = [:]         // folder → files skipped as a dataset
@@ -23,7 +29,7 @@ public struct CrawlReport: Sendable {
 /// For the code index (`IndexOptions.code`) it walks the code folders instead: code files only (`Rules.classifyCode`),
 /// in a git repo only those git keeps (`GitFiles`), and none in vendored or built folders.
 public enum Crawler {
-    public static func crawl(_ roots: [URL], options: IndexOptions) -> CrawlReport {
+    public static func crawl(_ roots: [URL], options: IndexOptions, reportExclusions: Bool = false) -> CrawlReport {
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser.path
         let keys = FileSystem.crawlKeys
@@ -33,6 +39,11 @@ public enum Crawler {
         var found: [Candidate] = []
         var foundPaths = Set<String>()   // a folder inside another root would be walked twice
         let rootPaths = Set(roots.map { $0.standardizedFileURL.path })
+        func exclude(_ path: String, _ reason: String) {
+            guard reportExclusions, let info = FileSystem.info(of: path), info.isRegular, !info.dataless else { return }
+            report.exclusions.append(.init(path: path, reason: reason, size: info.size, mtime: info.mtime,
+                                            inode: info.inode, device: info.device))
+        }
 
         for root in roots.map({ $0.standardizedFileURL }) {
             if options.code {
@@ -80,6 +91,7 @@ public enum Crawler {
                     report.skipped["other type", default: 0] += 1
                 case .skip(let reason):
                     report.skipped[reason, default: 0] += 1
+                    if !FileSystem.isInCloud(values) { exclude(url.path, reason) }
                 case .index(let kind):
                     guard let info = FileSystem.info(of: url.path), info.isRegular else {
                         report.skipped["link or special file", default: 0] += 1
@@ -96,10 +108,12 @@ public enum Crawler {
                             : options.maxCodeBytes
                         if info.size > limit {
                             report.skipped["too big to be written by hand", default: 0] += 1
+                            exclude(url.path, "too big to be written by hand")
                             return
                         }
                         if repos.ignores(url.path) {
                             report.skipped["ignored by git", default: 0] += 1
+                            exclude(url.path, "ignored by git")
                             return
                         }
                     }
@@ -131,6 +145,7 @@ public enum Crawler {
         for file in found {
             if !options.code, file.kind != .screenshot, isInProject((file.path as NSString).deletingLastPathComponent) {
                 report.skipped["inside a code project", default: 0] += 1
+                exclude(file.path, "inside a code project")
             } else {
                 kept.append(file)
             }
@@ -146,7 +161,10 @@ public enum Crawler {
                 kept.removeAll { file in
                     let skip = datasets[(file.path as NSString).deletingLastPathComponent] != nil
                         && [.image, .audio, .video].contains(file.kind)
-                    if skip { report.skipped["dataset", default: 0] += 1 }
+                    if skip {
+                        report.skipped["dataset", default: 0] += 1
+                        exclude(file.path, "dataset")
+                    }
                     return skip
                 }
             }
