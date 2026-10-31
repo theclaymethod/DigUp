@@ -477,6 +477,8 @@ class Collection:
     def command(self, operation):
         if not self.binary.is_file() or not os.access(self.binary, os.X_OK):
             raise ValueError('Build the DigUp fork first; see integrations/design-collection/README.md')
+        if operation == 'discover':
+            return [str(self.binary), operation]
         return [str(self.binary), operation, '--index', str(self.index)]
 
     def counts(self, code=False):

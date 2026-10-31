@@ -422,6 +422,8 @@ class MediaEvidenceTests(unittest.TestCase):
             discovery = self.collection.discover()
         self.assertIn('--code', native.call_args_list[1].args[0])
         self.assertNotIn('--code', native.call_args_list[0].args[0])
+        self.assertTrue(all('--index' not in call.args[0] for call in native.call_args_list))
+        self.assertEqual(self.collection.command('index-service')[-2:], ['--index', str(self.collection.index)])
         with self.collection.writer():
             self.collection.reconcile({**discovery, 'excluded': {}})
         self.assertIn(old_code, adapter.read(self.collection.indexed)['files'])
