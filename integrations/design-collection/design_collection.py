@@ -275,10 +275,17 @@ class Collection:
         return desired, indexed, files, legacy
 
     def eligible_files(self, desired, indexed_files, legacy, current, eligible, scope, lanes):
+        # Terminal skips attest processing, never retrieval evidence, even if old segments remain.
+        skipped = set()
+        for name in ('index.sqlite', 'code.sqlite'):
+            database = self.index / name
+            if database.exists():
+                with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=5) as db:
+                    skipped.update(row[0] for row in db.execute("SELECT path FROM files WHERE state='skipped'"))
         files, stale = {}, {}
         for path, info in indexed_files.items():
             ident = info['entry']
-            if ident not in eligible or info['lane'] not in lanes:
+            if ident not in eligible or info['lane'] not in lanes or path in skipped:
                 continue
             fresh = (not legacy and not info.get('legacy') and desired.get('files', {}).get(path) == info
                      and current[ident]['_manifest'] == info.get('manifest')
@@ -290,7 +297,7 @@ class Collection:
         return files, stale
 
     def reconcile(self):
-        """Activate only usable native rows at verified immutable paths; caller holds writer lock."""
+        """Attest usable or terminal-skipped native paths; caller holds writer lock."""
         desired, previous, old_files, legacy = self.provenance()
         desired_keys = {self.logical(info) for info in desired.get('files', {}).values()}
         revisions = {self.logical(info): (path, info) for path, info in old_files.items()}
@@ -298,20 +305,20 @@ class Collection:
         revisions = {key: (path, info) for key, (path, info) in revisions.items()
                      if info['entry'] in desired.get('entries', {})
                      and (info['lane'] != 'public' or key in desired_keys)}
-        usable = set()
+        processed = set()
         for name in ('index.sqlite', 'code.sqlite'):
             database = self.index / name
             if not database.exists():
                 continue
             with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=5) as db:
-                usable.update(row[0] for row in db.execute("""
-                    SELECT f.path FROM files f WHERE f.state IN ('done','partial') AND EXISTS (
+                processed.update(row[0] for row in db.execute("""
+                    SELECT f.path FROM files f WHERE f.state='skipped' OR (f.state IN ('done','partial') AND EXISTS (
                         SELECT 1 FROM segments s LEFT JOIN fts ON fts.rowid=s.id
                         WHERE s.file=f.id AND s.kind!='name'
-                          AND (s.vec IS NOT NULL OR length(coalesce(fts.original,fts.body,''))>0))
+                          AND (s.vec IS NOT NULL OR length(coalesce(fts.original,fts.body,''))>0)))
                     """))
         for path, info in desired.get('files', {}).items():
-            if path not in usable:
+            if path not in processed:
                 continue
             target = self.snapshot_path(path, info)
             if not target.is_file() or digest(target) != info['sha']:

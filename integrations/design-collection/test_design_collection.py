@@ -310,6 +310,61 @@ class MediaEvidenceTests(unittest.TestCase):
         self.hits = [self.hit(path=paths['media'])]
         self.assertFalse(self.search()['results'][0]['stale'])
 
+        # A terminal skip replaces legacy provenance without contributing even name-only evidence.
+        (self.entry / 'assets/clip.mp4').write_bytes(b'current bytes with no usable extraction')
+        self.collection.prepare()
+        desired = adapter.read(self.collection.manifest)
+        skipped_paths = {info['lane']: path for path, info in desired['files'].items()
+                         if info['source'] == 'assets/clip.mp4'}
+        indexed = adapter.read(self.collection.indexed)
+        for path in paths.values():
+            indexed['files'][path]['legacy'] = True
+        adapter.save(self.collection.indexed, indexed)
+        adapter.save(self.collection.index / 'receipt.json', {'generation': desired['generation']})
+        for ident, lane in enumerate(('media', 'public'), 3):
+            db.execute('INSERT INTO files VALUES(?,?,?,?,?)', (ident, skipped_paths[lane], 'video', 'pending', '{}'))
+            db.execute('INSERT INTO segments VALUES(?,?,?,?,?)', (ident, ident, 'audio', 4, b'not search evidence'))
+            db.execute('INSERT INTO fts(rowid,body,original) VALUES(?,?,?)', (ident, 'must not project', 'must not project'))
+        db.commit()
+        for state in ('pending', 'failed'):
+            with self.subTest(replacement=state):
+                db.execute('UPDATE files SET state=? WHERE id>=3', (state,))
+                db.commit()
+                with self.collection.writer():
+                    self.collection.reconcile()
+                files = adapter.read(self.collection.indexed)['files']
+                self.assertIn(paths['media'], files)
+                self.assertNotIn(skipped_paths['media'], files)
+                self.assertTrue(self.collection.status()['stale'])
+                self.assertTrue(self.collection.status()['rebuildRequired'])
+                self.assertTrue(self.search()['results'][0]['stale'])
+                self.assertEqual(self.search(scope='public')['results'], [])
+        db.execute("UPDATE files SET state='skipped' WHERE id>=3")
+        db.commit()
+        with self.collection.writer():
+            self.collection.reconcile()
+        files = adapter.read(self.collection.indexed)['files']
+        self.assertIn(skipped_paths['media'], files)
+        self.assertIn(skipped_paths['public'], files)
+        self.assertNotIn(paths['media'], files)
+        self.assertFalse(Path(paths['media']).exists())
+        self.assertFalse(self.collection.status()['stale'])
+        self.assertFalse(self.collection.status()['rebuildRequired'])
+        self.assertEqual(self.collection.counts()['states']['skipped'], 2)
+        self.hits = [self.hit(path=path, segment='name') for path in skipped_paths.values()]
+        self.assertEqual(self.search()['results'], [])
+        self.assertNotIn(skipped_paths['media'], self.requests[-1]['paths'])
+        self.assertEqual(self.search(scope='public')['results'], [])
+        self.assertEqual(self.collection.extracted_text(), {})
+        self.assertEqual(self.collection.extracted_text(scope='public'), {})
+        self.manifest['publish']['files'] = []
+        adapter.save(self.entry / 'entry.json', self.manifest)
+        self.assertEqual(self.search(scope='public')['results'], [])
+        self.collection.prepare()
+        with self.collection.writer():
+            self.collection.reconcile()
+        self.assertNotIn(skipped_paths['public'], adapter.read(self.collection.indexed)['files'])
+
     def test_legacy_map_is_private_stale_until_real_replacement_is_attested(self):
         self.collection.indexed.unlink()
         legacy = {**self.state, 'version': 1}
